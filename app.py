@@ -1,0 +1,332 @@
+import sys
+import sqlite3
+from PyQt5.QtWidgets import QApplication, QMainWindow, QFileDialog, QMessageBox, QInputDialog, QListWidgetItem
+from PyQt5.QtCore import QUrl, QTimer
+from PyQt5.QtMultimedia import QMediaPlayer, QMediaContent
+from main_window import Ui_MainWindow  # Импортируем сгенерированный файл
+import resources_rc
+from translations import Translator
+from music_search import MusicSearch
+
+
+
+class MusicApp(QMainWindow, Ui_MainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setupUi(self)
+        self.mediaPlayer = QMediaPlayer()
+        self.conn = sqlite3.connect('music.db')
+        self.cursor = self.conn.cursor()
+        self.is_playing = False  # Атрибут для отслеживания состояния воспроизведения
+
+        # Устанавливаем таймер для обновления прогресса
+        self.timer = QTimer()
+        self.timer.timeout.connect(self.update_progress)
+
+        # Привязываем кнопки управления к методам
+        self.playButton.clicked.connect(self.toggle_play_pause)
+        self.nextButton.clicked.connect(self.next_music)
+        self.prevButton.clicked.connect(self.prev_music)
+        self.volumeSlider.valueChanged.connect(self.set_volume)
+        self.searchButton.clicked.connect(self.search_music)
+        self.addTrackPlaylistButton.clicked.connect(self.add_or_remove_track_from_playlist)
+        self.addPlaylistButton.clicked.connect(self.add_playlist)
+        self.playlistsListWidget.currentItemChanged.connect(self.load_playlist_tracks)
+        self.playlistTracksListWidget.itemDoubleClicked.connect(self.play_selected_track_from_playlist)
+        self.searchResultsListWidget.itemDoubleClicked.connect(self.play_selected_track_from_search)
+        self.searchResultsListWidget.setVisible(False)  # Скрываем виджет результатов поиска по умолчанию
+
+        # Установка стартового объема
+        self.mediaPlayer.setVolume(self.volumeSlider.value())
+
+        # Загрузка плейлистов
+        self.load_playlists()
+
+        # Инициализация переводчика
+        self.translator = Translator()
+        # Пример в вашем коде, где вызывается метод
+        self.translator.update_language('Русский', self)  # Измените 'Russian' на 'Русский'
+
+
+        # Инициализация модуля поиска
+        self.music_search = MusicSearch()  # Инициализация объекта поиска музыки
+
+        # Добавляем языковые действия в меню
+        self.translator.add_language_action(self.viewMenu, 'Русский', self)
+        self.translator.add_language_action(self.viewMenu, 'Українська', self)
+        self.translator.add_language_action(self.viewMenu, 'English', self)
+
+        # Обработчики изменений статуса медиаплеера
+        self.mediaPlayer.stateChanged.connect(self.on_media_state_changed)
+        self.mediaPlayer.mediaStatusChanged.connect(self.on_media_status_changed)
+        self.ProgressSlider.sliderMoved.connect(self.seek_track)
+
+    def toggle_play_pause(self):
+        if self.is_playing:
+            self.mediaPlayer.pause()
+            self.playButton.setText("▶️")
+        else:
+            self.mediaPlayer.play()
+            self.playButton.setText("⏸️")
+        self.is_playing = not self.is_playing
+
+
+    def play_track(self, item):
+        title_artist = item.text().split(' - ')
+        self.current_track_title = title_artist[1]
+        self.current_track_artist = title_artist[0]
+        self.cursor.execute('SELECT download_url FROM tracks WHERE title=? AND artist=?', (self.current_track_title, self.current_track_artist))
+        track_url = self.cursor.fetchone()
+        
+        if track_url:
+            track_url = track_url[0]
+            track_url = f"https:{track_url}"  # Добавляем схему https
+            self.mediaPlayer.setMedia(QMediaContent(QUrl(track_url)))
+
+            # Обновляем слайдер и информацию о треке
+            self.mediaPlayer.mediaStatusChanged.connect(self.set_slider_maximum)
+            self.trackInfoLabel.setText(item.text())  # Отображение названия трека в метке
+            self.mediaPlayer.play()
+            self.playButton.setText("⏸️")
+            self.is_playing = True
+            self.timer.start(1000)  # Запускаем таймер для обновления прогресса
+            
+            # Обновляем состояние кнопки "Добавить в плейлист"
+            self.update_add_remove_button(self.playlistsListWidget.currentItem().data(0))
+        else:
+            QMessageBox.warning(self, 'Ошибка', 'Трек не найден в базе данных.')
+
+
+
+
+    def set_slider_maximum(self, status):
+        # Устанавливаем максимальное значение слайдера на основе длительности трека
+        duration = self.mediaPlayer.duration() // 1000  # Получаем длительность трека в секундах
+        if duration > 0:  # Проверяем, что длительность положительная
+            self.ProgressSlider.setMaximum(duration)  # Устанавливаем максимальное значение слайдера
+            self.update_track_info(self.mediaPlayer.position() // 1000, duration)  # Обновляем метку с длительностью
+
+    def update_progress(self):
+        current_position = self.mediaPlayer.position() // 1000  # Получаем текущую позицию в секундах
+        self.ProgressSlider.setValue(current_position)  # Обновляем значение слайдера
+        self.update_track_info(current_position, self.mediaPlayer.duration() // 1000)  # Обновляем метку с текущим временем
+
+    def update_track_info(self, current_position, duration):
+        current_minutes = current_position // 60
+        current_seconds = current_position % 60
+        duration_minutes = duration // 60
+        duration_seconds = duration % 60
+        self.trackInfoLabel2.setText(f"{current_minutes:02}:{current_seconds:02} / {duration_minutes:02}:{duration_seconds:02}")
+
+    def seek_track(self, position):
+        self.mediaPlayer.setPosition(position * 1000)  # Устанавливаем позицию воспроизведения
+
+    def on_media_state_changed(self, state):
+        if state == QMediaPlayer.StoppedState:
+            self.timer.stop()  # Останавливаем таймер, когда музыка остановлена
+
+    def on_media_status_changed(self, status):
+        if status == QMediaPlayer.EndOfMedia:
+            self.next_music()  # Переключаем на следующую песню при окончании
+
+    def next_music(self):
+        current_row = self.searchResultsListWidget.currentRow() if self.searchResultsListWidget.isVisible() else self.playlistTracksListWidget.currentRow()
+        next_row = (current_row + 1) % (self.searchResultsListWidget.count() if self.searchResultsListWidget.isVisible() else self.playlistTracksListWidget.count())
+        if self.searchResultsListWidget.isVisible():
+            self.searchResultsListWidget.setCurrentRow(next_row)
+            self.play_selected_track_from_search(self.searchResultsListWidget.currentItem())
+        else:
+            self.playlistTracksListWidget.setCurrentRow(next_row)
+            self.play_selected_track_from_playlist(self.playlistTracksListWidget.currentItem())
+
+    def prev_music(self):
+        current_row = self.searchResultsListWidget.currentRow() if self.searchResultsListWidget.isVisible() else self.playlistTracksListWidget.currentRow()
+        prev_row = (current_row - 1) % (self.searchResultsListWidget.count() if self.searchResultsListWidget.isVisible() else self.playlistTracksListWidget.count())
+        if self.searchResultsListWidget.isVisible():
+            self.searchResultsListWidget.setCurrentRow(prev_row)
+            self.play_selected_track_from_search(self.searchResultsListWidget.currentItem())
+        else:
+            self.playlistTracksListWidget.setCurrentRow(prev_row)
+            self.play_selected_track_from_playlist(self.playlistTracksListWidget.currentItem())
+
+    def set_volume(self, value):
+        self.mediaPlayer.setVolume(value)
+
+
+    def search_music(self):
+        query = self.searchLineEdit.text()
+
+        # Проверяем, есть ли скобки в запросе
+        if '(' in query and ')' in query:
+            # Сначала ищем в API
+            api_results = self.music_search.search_music_by_lyrics(query)
+            
+            long_words = []
+            if api_results:  # Если нашлись результаты в API
+                # Извлекаем слова из результатов API
+                for result in api_results:
+                    title_artist = result.split(" - ")  # Разделяем строку на название и исполнителя
+                    title = title_artist[0]
+                    # Добавляем только те слова, которые длиннее 3 букв
+                    long_words.extend([word for word in title.split() if len(word) > 3])
+
+                # Убираем дубликаты
+                long_words = list(set(long_words))
+
+                # Теперь ищем в БД по всем найденным словам
+                db_results = self.music_search.search_in_database(long_words, self.cursor)
+
+                # Обновляем виджет результатов поиска
+                self.searchResultsListWidget.clear()
+                if db_results:
+                    for row in db_results:
+                        track_info = f"{row[1]} - {row[0]}"  # Формируем строку с названием и артистом
+                        self.searchResultsListWidget.addItem(track_info)  # Добавляем информацию о треке
+                    self.searchResultsListWidget.setVisible(True)  # Показываем виджет результатов поиска
+                else:
+                    print("Нет найденных песен в базе данных.")
+                    self.searchResultsListWidget.setVisible(False)  # Скрываем виджет, если нет результатов
+            else:
+                print("Нет результатов от API.")
+                self.searchResultsListWidget.setVisible(False)  # Скрываем виджет, если нет результатов
+        else:
+            # Если нет скобок, ищем напрямую в базе данных
+            db_results = self.music_search.search_in_database([query], self.cursor)
+            
+            # Обновляем виджет результатов поиска
+            self.searchResultsListWidget.clear()
+            if db_results:
+                for row in db_results:
+                    track_info = f"{row[1]} - {row[0]}"  # Формируем строку с названием и артистом
+                    self.searchResultsListWidget.addItem(track_info)  # Добавляем информацию о треке
+                self.searchResultsListWidget.setVisible(True)  # Показываем виджет результатов поиска
+            else:
+                print("Нет найденных песен в базе данных.")
+                self.searchResultsListWidget.setVisible(False)  # Скрываем виджет, если нет результатов
+
+
+
+
+
+
+
+
+    def add_playlist(self):
+        playlist_name, ok = QInputDialog.getText(self, 'Создать плейлист', 'Введите название плейлиста:')
+        if ok and playlist_name:
+            self.cursor.execute('INSERT INTO playlists (name) VALUES (?)', (playlist_name,))
+            self.conn.commit()
+            self.load_playlists()
+
+    def load_playlists(self):
+        self.playlistsListWidget.clear()
+        self.cursor.execute('SELECT playlist_id, name FROM playlists')
+        for row in self.cursor.fetchall():
+            # Creating the display text to include both playlist_id and name
+            display_text = f"{row[0]} - {row[1]}"
+            # Creating the QListWidgetItem with the combined text
+            item = QListWidgetItem(display_text)
+            # Storing the playlist_id in the item's data for future reference
+            item.setData(0, row[0])
+            # Adding the item to the QListWidget
+            self.playlistsListWidget.addItem(item)
+
+
+    def add_or_remove_track_from_playlist(self):
+        # Проверяем, есть ли текущий трек
+        if not hasattr(self, 'current_track_title') or not self.current_track_title:
+            QMessageBox.warning(self, 'Ошибка', 'Нет выбранного трека для добавления или удаления.')
+            return
+
+        current_item = self.searchResultsListWidget.currentItem() or self.playlistTracksListWidget.currentItem()
+        if current_item:
+            title_artist = current_item.text().split(' - ')
+            track_title = title_artist[1]
+            track_artist = title_artist[0]
+            selected_playlist_item = self.playlistsListWidget.currentItem()
+            if selected_playlist_item:
+                playlist_id = selected_playlist_item.data(0)
+                self.cursor.execute('SELECT track_id FROM tracks WHERE title=? AND artist=?', (track_title, track_artist))
+                track_id = self.cursor.fetchone()
+                if track_id:
+                    track_id = track_id[0]
+                    self.cursor.execute('SELECT * FROM playlist_tracks WHERE playlist_id=? AND track_id=?', (playlist_id, track_id))
+                    result = self.cursor.fetchone()
+                    if result:
+                        # Если трек уже есть в плейлисте, удаляем его
+                        self.cursor.execute('DELETE FROM playlist_tracks WHERE playlist_id=? AND track_id=?', (playlist_id, track_id))
+                        self.conn.commit()
+                        QMessageBox.information(self, 'Успех', 'Трек удален из плейлиста!')
+                    else:
+                        # Если трека нет в плейлисте, добавляем его
+                        self.cursor.execute('INSERT INTO playlist_tracks (playlist_id, track_id) VALUES (?, ?)', (playlist_id, track_id))
+                        self.conn.commit()
+                        QMessageBox.information(self, 'Успех', 'Трек добавлен в плейлист!')
+                    self.load_playlist_tracks()
+                    self.update_add_remove_button(self.playlistsListWidget.currentItem().data(0))
+                else:
+                    QMessageBox.warning(self, 'Ошибка', 'Трек не найден в базе данных.')
+            else:
+                QMessageBox.warning(self, 'Ошибка', 'Выберите плейлист для добавления или удаления трека.')
+        else:
+            QMessageBox.warning(self, 'Ошибка', 'Выберите трек для добавления или удаления.')
+
+
+
+
+    def load_playlist_tracks(self):
+        self.playlistTracksListWidget.clear()
+        selected_playlist_item = self.playlistsListWidget.currentItem()
+        if selected_playlist_item:
+            playlist_id = selected_playlist_item.data(0)
+            self.cursor.execute('''
+                SELECT tracks.title, tracks.artist
+                FROM tracks
+                JOIN playlist_tracks ON tracks.track_id = playlist_tracks.track_id
+                WHERE playlist_tracks.playlist_id = ?
+            ''', (playlist_id,))
+            for row in self.cursor.fetchall():
+                self.playlistTracksListWidget.addItem(f"{row[1]} - {row[0]}")
+            
+            # Обновляем состояние кнопки "Добавить в плейлист"
+            self.update_add_remove_button(playlist_id)
+        else:
+            self.addTrackPlaylistButton.setEnabled(False)
+
+
+    def play_selected_track_from_playlist(self, item):
+        self.searchResultsListWidget.setVisible(False)  # Скрываем результаты поиска при воспроизведении трека из плейлиста
+        self.play_track(item)
+
+    def play_selected_track_from_search(self, item):
+        self.play_track(item)
+
+    def update_add_remove_button(self, playlist_id):
+        if not hasattr(self, 'current_track_title') or not self.current_track_title:
+            self.addTrackPlaylistButton.setEnabled(False)
+            return
+
+        self.cursor.execute('SELECT track_id FROM tracks WHERE title=? AND artist=?', (self.current_track_title, self.current_track_artist))
+        track_id = self.cursor.fetchone()
+
+        if track_id:
+            track_id = track_id[0]
+            self.cursor.execute('SELECT * FROM playlist_tracks WHERE playlist_id=? AND track_id=?', (playlist_id, track_id))
+            if self.cursor.fetchone():
+                self.addTrackPlaylistButton.setText("Удалить из плейлиста")
+            else:
+                self.addTrackPlaylistButton.setText("Добавить в плейлист")
+            self.addTrackPlaylistButton.setEnabled(True)
+        else:
+            self.addTrackPlaylistButton.setEnabled(False)
+
+
+
+
+
+
+if __name__ == '__main__':
+    app = QApplication(sys.argv)
+    window = MusicApp()
+    window.show()
+    sys.exit(app.exec_())
